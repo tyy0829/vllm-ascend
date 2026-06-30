@@ -194,25 +194,12 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         metadata = self._get_connector_metadata()
-        logger.debug(
-            "KV pool connector start_load_kv metadata_requests=%d specs=%s",
-            len(metadata.requests),
-            [
-                (
-                    request.req_id,
-                    None if request.load_spec is None else request.load_spec.can_load,
-                    None if request.load_spec is None else request.load_spec.vllm_cached_tokens,
-                    None if request.load_spec is None else request.load_spec.kvpool_cached_tokens,
-                )
-                for request in metadata.requests
-            ],
-        )
         self.connector_worker.start_load_kv(metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.use_layerwise:
             return
-        self.connector_worker.wait_for_layer_load()
+        self.connector_worker.wait_for_layer_load(layer_name=layer_name)
 
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
@@ -221,9 +208,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
             return
 
         if self.kv_role == "kv_consumer":
-            # Don't do save if the role is kv_consumer
             return
-        self.connector_worker.save_kv_layer(self._get_connector_metadata())
+        self.connector_worker.save_kv_layer(self._get_connector_metadata(), layer_name=layer_name)
 
     def wait_for_save(self):
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
