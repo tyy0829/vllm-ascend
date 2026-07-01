@@ -35,7 +35,9 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     PoolKey,
     ReqMeta,
     RequestTracker,
+    get_block_hashes,
     get_cache_family_granularity,
+    infer_cache_family_ratio,
     infer_group_cache_families,
     normalize_block_ids_by_group,
 )
@@ -80,8 +82,6 @@ class KVPoolScheduler:
                     raise NotImplementedError(
                         "AscendStore hybrid linear-attention support currently requires mamba_cache_mode='align'."
                     )
-        if self.use_layerwise and len(self.kv_cache_group_ids) > 1:
-            raise NotImplementedError("AscendStore layerwise mode does not yet support hybrid KV cache groups.")
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.consumer_is_to_load = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "consumer_is_to_load", False
@@ -100,6 +100,8 @@ class KVPoolScheduler:
         self.original_block_size = self._infer_group_block_sizes(vllm_config, kv_cache_config)
         cp_scale = self.pcp_size * self.dcp_size
         self.grouped_block_size = [block_size * cp_scale for block_size in self.original_block_size]
+        self.group_page_sizes: list[int] = []
+        self.group_num_layers_list: list[int] = []
         requested_hash_block_size = vllm_config.cache_config.hash_block_size
         if not isinstance(requested_hash_block_size, int):
             requested_hash_block_size = None
@@ -172,6 +174,18 @@ class KVPoolScheduler:
         num_layer_keys = self.num_layers if self.use_gva_layerwise else 1
         keys_per_block_hash = self.pcp_size * self.dcp_size * (self.tp_size // self.put_step) * num_layer_keys
         self.keys_per_block_hash = keys_per_block_hash
+
+        if self.use_hybrid:
+            for group_spec in kv_cache_config.kv_cache_groups:
+                spec = group_spec.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    spec = next(iter(spec.kv_cache_specs.values()))
+                self.group_page_sizes.append(spec.page_size_bytes)
+                self.group_num_layers_list.append(len(group_spec.layer_names))
+        else:
+            self.group_page_sizes.append(self.page_size_bytes)
+            self.group_num_layers_list.append(self.num_layers)
+
         self.client: LookupKeyClient | None = None
 
     def _get_or_create_request_tracker(self, req_id: str) -> RequestTracker:
@@ -225,36 +239,48 @@ class KVPoolScheduler:
         stored GVA; missing keys are allocated here so later layer load/save
         tasks can build complete transfer arrays.
         """
-        block_keys, _ = self.generate_keys(block_hashes)
-        if not block_keys:
-            request_tracker.block_keys = []
-            request_tracker.block_gvas = []
-            request_tracker.gva_block_offset = 0
-            return
-
-        key_infos = self.store_scheduler.batch_get_key_info(block_keys)
-        block_gvas = [0] * len(block_keys)
-        missing_keys = []
-        missing_indices = []
-        for index, key_info in enumerate(key_infos):
-            sizes = key_info.size()
-            if sizes and sizes > 0:
-                block_gvas[index] = key_info.gva_list()[0]
-            else:
-                missing_keys.append(block_keys[index])
-                missing_indices.append(index)
-
-        if missing_keys:
-            alloc_size = self.page_size_bytes * self.keys_per_block_hash
-            new_gvas = self.store_scheduler.batch_alloc(missing_keys, [alloc_size] * len(missing_keys))
-            if any(gva <= 0 for gva in new_gvas):
-                raise ValueError(f"Request {request_tracker.req_id}: batch_alloc failed, gvas={new_gvas}")
-            for index, gva in zip(missing_indices, new_gvas):
-                block_gvas[index] = gva
-
-        request_tracker.block_keys = block_keys
-        request_tracker.block_gvas = block_gvas
+        request_tracker.block_gvas_by_group = []
+        request_tracker.block_keys = []
+        request_tracker.block_gvas = []
         request_tracker.gva_block_offset = 0
+        for group_id in range(len(self.grouped_block_size)):
+            effective_block_size = self._get_effective_group_block_size(group_id)
+            group_block_hashes = get_block_hashes(
+                block_hashes, effective_block_size, self.hash_block_size
+            )
+            block_keys = [f"{self.model_name}@{group_id}@{bh.hex()}" for bh in group_block_hashes]
+            if group_id == 0:
+                request_tracker.block_keys = block_keys
+            if not block_keys:
+                request_tracker.block_gvas_by_group.append([])
+                continue
+
+            key_infos = self.store_scheduler.batch_get_key_info(block_keys)
+            block_gvas = [0] * len(block_keys)
+            missing_keys = []
+            missing_indices = []
+            for index, key_info in enumerate(key_infos):
+                sizes = key_info.size()
+                if sizes and sizes > 0:
+                    block_gvas[index] = key_info.gva_list()[0]
+                else:
+                    missing_keys.append(block_keys[index])
+                    missing_indices.append(index)
+
+            if missing_keys:
+                group_page_size = self.group_page_sizes[group_id]
+                group_num_layers = self.group_num_layers_list[group_id]
+                group_keys_per_block = (self.tp_size // self.put_step) * group_num_layers
+                alloc_size = group_page_size * group_keys_per_block
+                new_gvas = self.store_scheduler.batch_alloc(missing_keys, [alloc_size] * len(missing_keys))
+                if any(gva <= 0 for gva in new_gvas):
+                    raise ValueError(f"Request {request_tracker.req_id}: batch_alloc failed, gvas={new_gvas}")
+                for index, gva in zip(missing_indices, new_gvas):
+                    block_gvas[index] = gva
+
+            request_tracker.block_gvas_by_group.append(block_gvas)
+            if group_id == 0:
+                request_tracker.block_gvas = block_gvas
 
     def generate_keys(self, block_hashes, req_id="", has_last_block=False):
         block_keys = []
@@ -355,31 +381,52 @@ class KVPoolScheduler:
         token_len: int,
         num_computed_tokens: int,
     ) -> int:
-        num_blocks = token_len // self._block_size
-        num_queried_hit_blocks = 0
-        block_hashes_to_check = request.block_hashes[:num_blocks]
-        keys_to_check = [f"{self.model_name}@{bh.hex()}" for bh in block_hashes_to_check]
         # In layerwise mode, always query from block 0 because the remote
         # pool stores per-layer data that may not match local prefix cache.
-        query_start_block = 0 if self.use_layerwise else min(num_computed_tokens // self._block_size, num_blocks)
-        keys_to_query = keys_to_check[query_start_block:]
-        if not keys_to_query:
+        start_pos = 0 if self.use_layerwise else min(num_computed_tokens, token_len)
+        num_hash_blocks = token_len // self.hash_block_size
+        block_hashes_to_check = request.block_hashes[:num_hash_blocks]
+        hits_per_group: list[int] = []
+        self._get_or_create_request_tracker(request.request_id)
+
+        for group_id in range(len(self.grouped_block_size)):
+            effective_block_size = self._get_effective_group_block_size(group_id)
+            group_block_hashes = get_block_hashes(
+                block_hashes_to_check, effective_block_size, self.hash_block_size
+            )
+            keys_to_query = [f"{self.model_name}@{group_id}@{bh.hex()}" for bh in group_block_hashes]
+            if not keys_to_query:
+                # Skip groups with no keys; do not include them in the min.
+                continue
+
+            key_infos = self.store_scheduler.batch_get_key_info(keys_to_query)
+            exists = []
+            for key_info in key_infos:
+                sizes = key_info.size()
+                if sizes and sizes > 0:
+                    exists.append(True)
+                else:
+                    break
+            hit_end = len(exists) * effective_block_size
+            # Back off to a cache_transfer_granularity-aligned boundary so the
+            # hit count is coherent across all KV cache groups.
+            for index in range(len(exists), 0, -1):
+                if (start_pos + index * effective_block_size) % self.cache_transfer_granularity == 0:
+                    hit_end = index * effective_block_size
+                    break
+            hits_per_group.append(hit_end)
+
+        if not hits_per_group:
             return 0
-        tracker = self._get_or_create_request_tracker(request.request_id)
-        cached_gvas = []
-        key_infos = self.store_scheduler.batch_get_key_info(keys_to_query)
-        for key_info in key_infos:
-            sizes = key_info.size()
-            if sizes and sizes > 0:
-                cached_gvas.append(key_info.gva_list()[0])
-                num_queried_hit_blocks += 1
-            else:
-                break
-        num_hit_blocks = query_start_block + num_queried_hit_blocks
-        tracker.block_keys = keys_to_check[query_start_block:num_hit_blocks]
-        tracker.block_gvas = cached_gvas[:num_queried_hit_blocks]
-        tracker.gva_block_offset = query_start_block
-        return num_hit_blocks * self._block_size
+        hit_tokens = min(hits_per_group)
+        logger.info(
+            "Reqid: %s, token_len %d, layerwise gva hits_per_group %s, hit_tokens %d",
+            request.request_id,
+            token_len,
+            hits_per_group,
+            hit_tokens,
+        )
+        return hit_tokens
 
     def _infer_group_families(self) -> list[str]:
         kv_cache_groups = self.kv_cache_config.kv_cache_groups if self.kv_cache_config is not None else None
@@ -410,6 +457,10 @@ class KVPoolScheduler:
         if group_id >= len(families):
             return "default"
         return families[group_id]
+
+    def _get_effective_group_block_size(self, group_id: int) -> int:
+        cache_family = self._get_group_family(self.kv_cache_group_families, group_id)
+        return self._get_group_block_size(group_id) * max(infer_cache_family_ratio(cache_family), 1)
 
     def _infer_cache_transfer_granularity(self) -> int:
         granularities = [self.lcm_block_size]
@@ -706,7 +757,7 @@ class KVPoolScheduler:
             gva_block_offset=(previous_tracker.gva_block_offset if previous_tracker else 0),
         )
         self._request_trackers[request.req_id] = request_tracker
-        num_blocks = num_tokens_to_compute // self._block_size
+        num_blocks = num_tokens_to_compute // self.hash_block_size
         has_last_block = num_tokens_to_compute % self._block_size != 0
         self._allocate_gva_if_needed(
             request_tracker,
@@ -753,7 +804,7 @@ class KVPoolScheduler:
             gva_block_offset=(previous_tracker.gva_block_offset if previous_tracker else 0),
         )
         self._request_trackers[req_id] = request_tracker
-        num_blocks = len(new_block_ids_by_group[0])
+        num_blocks = num_tokens_to_compute // self.hash_block_size
         has_last_block = num_tokens_to_compute % self._block_size != 0
         self._allocate_gva_if_needed(
             request_tracker,
@@ -795,8 +846,8 @@ class KVPoolScheduler:
         else:
             raise ValueError(f"Request {req_id} is not in _unfinished_requests, but it is scheduled to be cached")
         prev_token_count = request_tracker.token_len - num_new_tokens
-        prev_hash_count = prev_token_count // self._block_size
-        current_hash_count = request_tracker.token_len // self._block_size
+        prev_hash_count = prev_token_count // self.hash_block_size
+        current_hash_count = request_tracker.token_len // self.hash_block_size
         new_hash_count = current_hash_count - prev_hash_count
         has_last_block = request_tracker.token_len % self._block_size != 0 or current_hash_count > len(
             request.block_hashes
@@ -848,7 +899,7 @@ class KVPoolScheduler:
             gva_block_offset=(previous_tracker.gva_block_offset if previous_tracker else 0),
         )
         self._request_trackers[request_id] = request_tracker
-        num_blocks = num_tokens_to_compute // self._block_size
+        num_blocks = num_tokens_to_compute // self.hash_block_size
         has_last_block = num_tokens_to_compute % self._block_size != 0
         self._allocate_gva_if_needed(
             request_tracker,

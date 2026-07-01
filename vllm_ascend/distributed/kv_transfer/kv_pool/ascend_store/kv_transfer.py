@@ -54,19 +54,21 @@ class LayerBatchBuilder:
         num_ranks_per_layer: int,
         page_size_bytes: int,
         num_layers: int,
+        group_id: int = 0,
     ) -> None:
         self.my_key_index = my_key_index
         self.num_ranks_per_layer = num_ranks_per_layer
         self.page_size_bytes = page_size_bytes
         self.num_layers = num_layers
-        self._block_len_np = np.asarray(token_database.group_block_len[0], dtype=np.int64)
+        self.group_id = group_id
+        self._block_len_np = np.asarray(token_database.group_block_len[group_id], dtype=np.int64)
         self._kv_caches_base_addr_np = np.asarray(
-            token_database.group_kv_caches_base_addr[0],
+            token_database.group_kv_caches_base_addr[group_id],
             dtype=np.int64,
         )
-        group_block_stride = token_database.group_block_stride.get(0, token_database.group_block_len[0])
+        group_block_stride = token_database.group_block_stride.get(group_id, token_database.group_block_len[group_id])
         self._block_stride_np = np.asarray(group_block_stride, dtype=np.int64)
-        # group_block_len[0] / kv_caches_base_addr[0] are laid out flat as
+        # group_block_len[group_id] / kv_caches_base_addr[group_id] are laid out flat as
         # [layer0_caches..., layer1_caches..., ...]; the per-layer stride is the
         # total length divided by the number of layers (mirrors
         # ChunkedTokenDatabase caches_per_layer computation).
@@ -134,14 +136,22 @@ class LayerBatchBuilder:
             gvas_arr.ravel(),
         )
 
-    @staticmethod
     def _require_request_arrays(
+        self,
         block_range: LayerBlockRange,
     ) -> tuple[np.ndarray, np.ndarray]:
         request = block_range.request
-        if request.block_ids_np is None or request.block_gvas_np is None:
+        group_id = self.group_id
+        if (request.block_gvas_by_group_np is not None
+                and group_id < len(request.block_gvas_by_group_np)):
+            block_ids_np = request.block_ids_by_group_np[group_id]
+            block_gvas_np = request.block_gvas_by_group_np[group_id]
+        else:
+            block_ids_np = request.block_ids_np
+            block_gvas_np = request.block_gvas_np
+        if block_ids_np is None or block_gvas_np is None:
             raise RuntimeError("ReqMeta numpy block metadata is not initialized")
-        return request.block_ids_np, request.block_gvas_np
+        return block_ids_np, block_gvas_np
 
     def build_shared(self, task: LayerTransferTask) -> SharedBlockData | None:
         """Pre-compute shared block data that is identical across all layers."""
@@ -1094,6 +1104,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         sync_save_events: list[torch.npu.Event],
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
+        group_builders: list[LayerBatchBuilder] | None = None,
     ):
         super().__init__(
             m_store,
@@ -1113,13 +1124,19 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.sync_save_events = sync_save_events
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
-        self.layer_batch_builder = LayerBatchBuilder(
-            token_database,
-            my_key_index,
-            num_ranks_per_layer,
-            page_size_bytes,
-            num_layers,
-        )
+        if group_builders is not None:
+            self.group_builders = group_builders
+            self.layer_batch_builder = group_builders[0]
+        else:
+            self.group_builders = None
+            self.layer_batch_builder = LayerBatchBuilder(
+                token_database,
+                my_key_index,
+                num_ranks_per_layer,
+                page_size_bytes,
+                num_layers,
+                group_id=0,
+            )
 
     def add_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -1137,7 +1154,11 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
 
     def build_shared_data(self, task: LayerTransferTask) -> SharedBlockData | None:
         """Pre-compute shared block data for all layers (GVA path)."""
-        return self.layer_batch_builder.build_shared(task)
+        if self.group_builders is not None:
+            builder = self.group_builders[task.group_id]
+        else:
+            builder = self.layer_batch_builder
+        return builder.build_shared(task)
 
     def add_request(  # type: ignore[override]
         self, req_meta: list[LayerTransferTask]
@@ -1210,6 +1231,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         h2d_stagger_us: int = 0,
         max_transfer_blocks: int = 0,
         max_transfer_bytes: int = 0,
+        group_builders: list[LayerBatchBuilder] | None = None,
     ):
         super().__init__(
             m_store,
@@ -1228,17 +1250,27 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
         self.h2d_stagger_us = h2d_stagger_us
         self.max_transfer_blocks = max_transfer_blocks
         self.max_transfer_bytes = max_transfer_bytes
-        self.layer_batch_builder = LayerBatchBuilder(
-            token_database,
-            my_key_index,
-            num_ranks_per_layer,
-            page_size_bytes,
-            num_layers,
-        )
+        if group_builders is not None:
+            self.group_builders = group_builders
+            self.layer_batch_builder = group_builders[0]
+        else:
+            self.group_builders = None
+            self.layer_batch_builder = LayerBatchBuilder(
+                token_database,
+                my_key_index,
+                num_ranks_per_layer,
+                page_size_bytes,
+                num_layers,
+                group_id=0,
+            )
 
     def build_shared_data(self, task: LayerTransferTask) -> SharedBlockData | None:
         """Pre-compute shared block data for all layers (GVA path)."""
-        return self.layer_batch_builder.build_shared(task)
+        if self.group_builders is not None:
+            builder = self.group_builders[task.group_id]
+        else:
+            builder = self.layer_batch_builder
+        return builder.build_shared(task)
 
     def add_request(  # type: ignore[override]
         self, req_meta: LayerLoadTask

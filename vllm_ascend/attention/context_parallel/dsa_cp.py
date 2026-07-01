@@ -13,8 +13,15 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
 
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, split_decodes_and_prefills
+from vllm_ascend.attention.utils import (
+    AscendCommonAttentionMetadata,
+    maybe_save_kv_layer_to_connector,
+    notify_kv_cache_written,
+    split_decodes_and_prefills,
+    wait_for_kv_layer_from_connector,
+)
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.memcache_comm_fence import record_attention_compute_start
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
@@ -1010,6 +1017,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
             return output.fill_(0)
         if not isinstance(attn_metadata, list):
             attn_metadata = [attn_metadata]
+        wait_for_kv_layer_from_connector(layer_name)
         local_attn_output = self._forward(layer_name, hidden_states, kv_cache, attn_metadata, need_gather_q_kv)
         o_proj_input = self._restore_tp_head_layout(local_attn_output, layer_name, attn_metadata[0])
         num_tokens = o_proj_input.shape[0]
@@ -1051,6 +1059,8 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 )
             o_proj_input = o_proj_input.reshape(num_tokens, -1)
             output[...] = self.wo_b(o_proj_input)
+
+        maybe_save_kv_layer_to_connector(layer_name, list(kv_cache))
 
         return output
 
@@ -1216,6 +1226,8 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 compress_kv_cache, compressed_kv, compressor_attn_metadata.req_metadata.slot_mapping
             )
 
+        notify_kv_cache_written(layer_name)
+        record_attention_compute_start()
         attn_op = DeviceOperator.get_dsa_sparse_attn_op()
         extra_attn_kwargs: dict = DeviceOperator.get_dsa_sparse_attn_base_kwargs()
         if has_prefill:

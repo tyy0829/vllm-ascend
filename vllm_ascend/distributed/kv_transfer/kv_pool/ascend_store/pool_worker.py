@@ -49,6 +49,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import
     KVCacheStoreRecvingThread,
     KVCacheStoreSendingThread,
     KVTransferThread,
+    LayerBatchBuilder,
     _circular_shift,
     record_failed_blocks,
 )
@@ -141,8 +142,6 @@ class KVPoolWorker:
         self.kv_cache_group_families = self._infer_group_families()
         self.group_uses_align_state = self._infer_group_uses_align_state()
         self.cache_transfer_granularity = self._infer_cache_transfer_granularity()
-        if self.use_layerwise and self.num_kv_cache_groups > 1:
-            raise NotImplementedError("AscendStore layerwise mode does not yet support hybrid KV cache groups.")
         self.h2d_stagger_us = int(extra_config.get("h2d_stagger_us", 0))
         self.layerwise_max_transfer_blocks = int(extra_config.get("layerwise_max_transfer_blocks", 0))
         self.layerwise_max_transfer_bytes = int(extra_config.get("layerwise_max_transfer_bytes", 0))
@@ -256,14 +255,37 @@ class KVPoolWorker:
         self._transfer_threads_started = False
 
     def _init_layerwise_config(self) -> None:
-        self.layer_load_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
-        self.layer_save_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.num_layers)]
+        self.total_layerwise_slots = self.num_layers
+        self.slot_group_ids = [0] * self.total_layerwise_slots
+        self.layer_load_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.total_layerwise_slots)]
+        self.layer_save_tasks: list[list[LayerTransferTask]] = [[] for i in range(self.total_layerwise_slots)]
         self.layer_load_finished_events: list[threading.Event] | None = None
         self.layer_save_finished_events: list[threading.Event] | None = None
 
         self.next_layer_to_submit = 0
         self.num_prefetch_layers = int(self._extra_config.get("layerwise_prefetch_layers", 1))
         self.sync_save_events: list[torch.npu.Event] | None = None
+
+    def _build_group_layer_builders(self) -> list[LayerBatchBuilder]:
+        builders = []
+        for group_id in range(self.num_kv_cache_groups):
+            group_num_layers = self.group_num_layers.get(group_id, self.num_layers)
+            group_block_len = self.group_block_len.get(group_id, self.group_block_len.get(0, []))
+            if group_block_len and group_num_layers > 0:
+                group_page_size = sum(group_block_len) // group_num_layers
+            else:
+                group_page_size = self.page_size_bytes
+            builders.append(
+                LayerBatchBuilder(
+                    self.token_database,
+                    self.my_key_index,
+                    self.num_ranks_per_layer,
+                    group_page_size,
+                    group_num_layers,
+                    group_id=group_id,
+                )
+            )
+        return builders
 
     def _start_kv_transfer_threads(self) -> None:
         if self._transfer_threads_started:
@@ -293,6 +315,7 @@ class KVPoolWorker:
                     self.sync_save_events,
                     self.layerwise_max_transfer_blocks,
                     self.layerwise_max_transfer_bytes,
+                    group_builders=self._build_group_layer_builders(),
                 )
                 self.kv_send_thread.start()
                 ready_event_sending.wait()
@@ -333,6 +356,7 @@ class KVPoolWorker:
                     self.h2d_stagger_us,
                     self.layerwise_max_transfer_blocks,
                     self.layerwise_max_transfer_bytes,
+                    group_builders=self._build_group_layer_builders(),
                 )
             else:
                 self.kv_recv_thread = KVCacheStoreKeyLayerRecvingThread(
@@ -425,6 +449,9 @@ class KVPoolWorker:
         if group_id >= len(self.grouped_block_size):
             return self.grouped_block_size[0]
         return self.grouped_block_size[group_id]
+
+    def _get_effective_group_block_size(self, group_id: int) -> int:
+        return self._get_group_block_size(group_id)
 
     @staticmethod
     def _get_group_family(families: list[str], group_id: int) -> str:
@@ -671,13 +698,15 @@ class KVPoolWorker:
         self,
         requests: list[ReqMeta],
         layer_id: int,
+        group_id: int = 0,
     ) -> None:
+        block_size = self._get_effective_group_block_size(group_id)
         request_block_ranges = []
         for request in requests:
             if request.can_save is None or not request.can_save:
                 continue
-            save_start_block = request.save_start_token // self.block_size
-            save_end_block = request.save_end_token // self.block_size
+            save_start_block = request.save_start_token // block_size
+            save_end_block = request.save_end_token // block_size
             if save_start_block >= save_end_block and request.partial_block_index is None:
                 continue
             partial_block_index = request.partial_block_index
@@ -694,6 +723,7 @@ class KVPoolWorker:
                 LayerTransferTask(
                     layer_id=layer_id,
                     block_ranges=request_block_ranges,
+                    group_id=group_id,
                 )
             )
 
@@ -701,23 +731,25 @@ class KVPoolWorker:
         self,
         requests: list[ReqMeta],
         layer_id: int,
+        group_id: int = 0,
     ) -> None:
+        block_size = self._get_effective_group_block_size(group_id)
         request_block_ranges = []
         for request in requests:
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
             cached_tokens = request.load_spec.kvpool_cached_tokens
-            load_start_block = request.load_spec.vllm_cached_tokens // self.block_size
-            cached_full_blocks = cached_tokens // self.block_size
+            load_start_block = request.load_spec.vllm_cached_tokens // block_size
+            cached_full_blocks = cached_tokens // block_size
             full_blocks = min(cached_full_blocks, len(request.block_hashes))
             needs_last_block_at_boundary = (
-                cached_tokens > 0 and cached_tokens % self.block_size == 0 and full_blocks < cached_full_blocks
+                cached_tokens > 0 and cached_tokens % block_size == 0 and full_blocks < cached_full_blocks
             )
             if request.last_block_gva is not None and (
-                cached_tokens % self.block_size != 0 or needs_last_block_at_boundary
+                cached_tokens % block_size != 0 or needs_last_block_at_boundary
             ):
                 partial_block_index = (
-                    cached_full_blocks if cached_tokens % self.block_size != 0 else cached_full_blocks - 1
+                    cached_full_blocks if cached_tokens % block_size != 0 else cached_full_blocks - 1
                 )
             else:
                 partial_block_index = None
@@ -738,6 +770,7 @@ class KVPoolWorker:
                 LayerTransferTask(
                     layer_id=layer_id,
                     block_ranges=request_block_ranges,
+                    group_id=group_id,
                 )
             )
 
@@ -792,11 +825,13 @@ class KVPoolWorker:
     def process_layer_data(self, requests: list[ReqMeta]) -> None:
         if not requests:
             return
-        for layer_id in range(self.num_layers):
-            self._process_save_for_layer_batch(requests, layer_id)
+        for slot_idx in range(self.total_layerwise_slots):
+            group_id = self.slot_group_ids[slot_idx] if hasattr(self, "slot_group_ids") else 0
+            self._process_save_for_layer_batch(requests, slot_idx, group_id)
         self._build_shared_save_data()
-        for layer_id in range(self.num_layers):
-            self._process_load_for_layer_batch(requests, layer_id)
+        for slot_idx in range(self.total_layerwise_slots):
+            group_id = self.slot_group_ids[slot_idx] if hasattr(self, "slot_group_ids") else 0
+            self._process_load_for_layer_batch(requests, slot_idx, group_id)
         self._build_shared_load_data()
 
     def _submit_ready_layer_loads(self) -> None:
