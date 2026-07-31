@@ -548,6 +548,7 @@ class NPUPlatform(Platform):
         # is supported by vllm-ascend.
         if (
             vllm_config.parallel_config.tensor_parallel_size > 1
+            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             and not vllm_config.model_config.enforce_eager
             and enable_sp(vllm_config)
         ):
@@ -1259,6 +1260,15 @@ class NPUPlatform(Platform):
                     "parameter=use_inductor_graph_partition, action: resetting to False."
                 )
                 vllm_config.compilation_config.use_inductor_graph_partition = False
+
+        # ==================== 11. VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS ====================
+        if envs_vllm.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS < 1836:
+            envs_vllm.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS = 3000
+            logger.info(
+                "The timeout interval of the HCCL operator is 1836s. Timeout in "
+                "seconds for execute_model RPC calls in multiprocessing must be "
+                "greater than 1836s, Set VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3000"
+            )
 
     @classmethod
     def use_custom_op_collectives(cls) -> bool:
